@@ -3,92 +3,195 @@ import React, { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
 import 'bootstrap/dist/css/bootstrap.min.css';
 
-const SOCKET_SERVER = 'http://localhost:3000';
+const SOCKET_SERVER = 'https://powder-intermediate-films-testing.trycloudflare.com';
+
+const RTCConfiguration = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun4.l.google.com:19302' }
+  ]
+};
 
 export default function RemoteDesktop() {
   const [socket, setSocket] = useState(null);
   const [connectionId, setConnectionId] = useState('');
   const [connectTo, setConnectTo] = useState('');
   const [isConnected, setIsConnected] = useState(false);
+  const [isHost, setIsHost] = useState(false);
   const [error, setError] = useState('');
+  const [status, setStatus] = useState('');
+  const [localStream, setLocalStream] = useState(null);
   const peerConnection = useRef(null);
   const remoteVideoRef = useRef(null);
+  const localVideoRef = useRef(null);
 
   useEffect(() => {
     const newSocket = io(SOCKET_SERVER);
     setSocket(newSocket);
 
-    return () => newSocket.disconnect();
+    return () => {
+      stopAllStreams();
+      if (peerConnection.current) {
+        peerConnection.current.close();
+      }
+      newSocket.disconnect();
+    };
   }, []);
+
+  const stopAllStreams = () => {
+    if (localStream) {
+      localStream.getTracks().forEach(track => track.stop());
+      setLocalStream(null);
+    }
+  };
 
   useEffect(() => {
     if (!socket) return;
 
-    socket.on(' ', ({ connectionId }) => {
-      console.log(connectionId)
+    socket.on('connectionEstablished', async ({ connectionId }) => {
+      console.log('Connection established as host');
       setConnectionId(connectionId);
+      setIsHost(true);
+      await startScreenShare();
     });
 
-    socket.on('remoteConnectionRequest', async ({ fromSocket }) => {
-      setupPeerConnection(fromSocket, true);
+    socket.on('joinedRoom', async ({ hostId }) => {
+      console.log('Joined room, creating peer connection');
+      await setupPeerConnection(hostId, false);
+      setStatus('Connected to host, establishing connection...');
+    });
+
+    socket.on('viewerJoined', async ({ viewerId }) => {
+      console.log('Viewer joined, sending stream');
+      if (isHost && localStream) {
+        await setupPeerConnection(viewerId, true);
+      }
     });
 
     socket.on('offer', async ({ offer, from }) => {
-      if (!peerConnection.current) {
-        await setupPeerConnection(from, false);
+      console.log('Received offer from:', from);
+      try {
+        if (!peerConnection.current) {
+          await setupPeerConnection(from, false);
+        }
+        await peerConnection.current.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await peerConnection.current.createAnswer();
+        await peerConnection.current.setLocalDescription(answer);
+        socket.emit('answer', { answer, to: from });
+      } catch (err) {
+        console.error('Error handling offer:', err);
+        setError('Failed to handle offer: ' + err.message);
       }
-      await peerConnection.current.setRemoteDescription(offer);
-      const answer = await peerConnection.current.createAnswer();
-      await peerConnection.current.setLocalDescription(answer);
-      socket.emit('answer', { answer, to: from });
     });
 
     socket.on('answer', async ({ answer }) => {
-      await peerConnection.current.setRemoteDescription(answer);
+      console.log('Received answer');
+      try {
+        await peerConnection.current.setRemoteDescription(new RTCSessionDescription(answer));
+      } catch (err) {
+        console.error('Error handling answer:', err);
+        setError('Failed to handle answer: ' + err.message);
+      }
     });
 
     socket.on('iceCandidate', async ({ candidate }) => {
-      if (candidate) {
-        await peerConnection.current.addIceCandidate(candidate);
+      try {
+        if (candidate && peerConnection.current) {
+          await peerConnection.current.addIceCandidate(new RTCIceCandidate(candidate));
+        }
+      } catch (err) {
+        console.error('Error adding ICE candidate:', err);
+        setError('Failed to add ICE candidate: ' + err.message);
       }
     });
-  }, [socket]);
 
-  const setupPeerConnection = async (remoteSocketId, isHost) => {
+    socket.on('error', ({ message }) => {
+      setError(message);
+    });
+  }, [socket, isHost, localStream]);
+
+  const setupPeerConnection = async (peerId, isInitiator) => {
     try {
-      peerConnection.current = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-      });
+      console.log('Setting up peer connection, isInitiator:', isInitiator);
+      if (peerConnection.current) {
+        peerConnection.current.close();
+      }
 
-      peerConnection.current.onicecandidate = ({ candidate }) => {
+      const pc = new RTCPeerConnection(RTCConfiguration);
+      peerConnection.current = pc;
+
+      pc.onicecandidate = ({ candidate }) => {
         if (candidate) {
-          socket.emit('iceCandidate', { candidate, to: remoteSocketId });
+          console.log('Sending ICE candidate');
+          socket.emit('iceCandidate', { candidate, to: peerId });
         }
       };
 
-      peerConnection.current.ontrack = (event) => {
-        if (remoteVideoRef.current) {
+      pc.oniceconnectionstatechange = () => {
+        console.log('ICE Connection State:', pc.iceConnectionState);
+        setStatus(`Connection state: ${pc.iceConnectionState}`);
+      };
+
+      pc.ontrack = (event) => {
+        console.log('Received remote track');
+        if (remoteVideoRef.current && event.streams[0]) {
           remoteVideoRef.current.srcObject = event.streams[0];
+          setStatus('Receiving remote stream');
         }
       };
 
-      if (isHost) {
-        const stream = await navigator.mediaDevices.getDisplayMedia({
-          video: true,
-          audio: false
+      if (isInitiator && localStream) {
+        console.log('Adding local stream tracks');
+        localStream.getTracks().forEach(track => {
+          pc.addTrack(track, localStream);
         });
         
-        stream.getTracks().forEach(track => {
-          peerConnection.current.addTrack(track, stream);
+        console.log('Creating offer');
+        const offer = await pc.createOffer({
+          offerToReceiveAudio: false,
+          offerToReceiveVideo: true
         });
-
-        const offer = await peerConnection.current.createOffer();
-        await peerConnection.current.setLocalDescription(offer);
-        socket.emit('offer', { offer, to: remoteSocketId });
+        await pc.setLocalDescription(offer);
+        socket.emit('offer', { offer, to: peerId });
       }
-    } catch (error) {
-      setError('Error setting up connection: ' + error.message);
-      console.error('Connection setup error:', error);
+
+      return pc;
+    } catch (err) {
+      console.error('Error in setupPeerConnection:', err);
+      setError('Failed to setup connection: ' + err.message);
+      throw err;
+    }
+  };
+
+  const startScreenShare = async () => {
+    try {
+      console.log('Starting screen share');
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: {
+          cursor: "always",
+          displaySurface: "monitor"
+        },
+        audio: false
+      });
+
+      setLocalStream(stream);
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
+      setStatus('Screen sharing started');
+
+      stream.getVideoTracks()[0].onended = () => {
+        console.log('Screen sharing stopped by user');
+        setStatus('Screen sharing stopped');
+        stopAllStreams();
+      };
+
+    } catch (err) {
+      console.error('Error in startScreenShare:', err);
+      setError('Failed to start screen sharing: ' + err.message);
     }
   };
 
@@ -122,6 +225,12 @@ export default function RemoteDesktop() {
                 </div>
               )}
               
+              {status && (
+                <div className="alert alert-info" role="alert">
+                  {status}
+                </div>
+              )}
+              
               {!isConnected ? (
                 <div>
                   <div className="mb-4">
@@ -144,6 +253,19 @@ export default function RemoteDesktop() {
                       </div>
                     )}
                   </div>
+
+                  {localStream && (
+                    <div className="mb-4">
+                      <h5>Your Screen Share Preview:</h5>
+                      <video
+                        ref={localVideoRef}
+                        autoPlay
+                        playsInline
+                        muted
+                        className="w-100 rounded"
+                      />
+                    </div>
+                  )}
 
                   <div className="mt-4">
                     <div className="form-group">
@@ -168,9 +290,6 @@ export default function RemoteDesktop() {
                 </div>
               ) : (
                 <div>
-                  <div className="alert alert-info mb-3">
-                    Connected to remote session
-                  </div>
                   <div className="ratio ratio-16x9">
                     <video
                       ref={remoteVideoRef}

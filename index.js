@@ -1,64 +1,133 @@
-const express = require('express');
+// server/index.js
+const express = require("express");
 const app = express();
-const cors = require('cors');
-
-app.use(cors({origin:"*"}))
 const server = require("http").Server(app);
 const io = require("socket.io")(server, {
   cors: {
-    origin: "*",  // Allow all origins
+    origin: "*",
     methods: ["GET", "POST"],
     allowedHeaders: ["*"],
-    credentials: true
-  }
-})
-const {v4:uuuidv4}= require("uuid")
+    credentials: true,
+  },
+});
+const cors = require("cors");
+const { v4: uuidv4 } = require("uuid");
 
-const PORT = process.env.PORT || 3000
-const connections = new Map()
+const PORT = process.env.PORT || 3000;
 
+app.use(
+  cors({
+    origin: "*",
+    methods: "GET,HEAD,PUT,PATCH,POST,DELETE",
+    credentials: true,
+    optionsSuccessStatus: 204,
+  })
+);
 
-io.on("connection", (socket)=>{
+// Store active rooms and their participants
+const rooms = new Map(); // roomId -> { hostId, viewers: Set, hostSocket }
 
-    console.log("New client connected");
+io.on("connection", (socket) => {
+  console.log("New client connected:", socket.id);
 
-    socket.on("requestConnection", ()=>{
-        const connectionId = uuuidv4()
-        connections.set(connectionId, socket.id)
-        socket.emit("connectionEstablished", {connectionId})
-    })
+  // Host creates a new room
+  socket.on("requestConnection", () => {
+    // const roomId = uuidv4();
+    const roomId = "1234567"
+    rooms.set(roomId, {
+      hostId: socket.id,
+      viewers: new Set(),
+      hostSocket: socket,
+    });
+    socket.join(roomId);
+    socket.emit("connectionEstablished", {
+      connectionId: roomId,
+      viewerCount: 0,
+    });
+    console.log(`Host ${socket.id} created room ${roomId}`);
+  });
 
-    socket.on("joinConnection",({connectionId})=>{
-        const hostSocketId = connections.get(connectionId)
-        if(hostSocketId) {
-            io.to(hostSocketId).emit("remoteConnectionRequest",{
-                fromSocket:socket.io
-            })
-        }
-    })
+  // Viewer joins a room
+  socket.on("joinConnection", ({ connectionId }) => {
+    const room = rooms.get(connectionId);
+    if (room) {
+      room.viewers.add(socket.id);
+      socket.join(connectionId);
 
-    socket.on('offer', ({ offer, to }) => {
-        io.to(to).emit('offer', { offer, from: socket.id });
+      // Notify host about new viewer
+      io.to(room.hostId).emit("viewerJoined", {
+        viewerId: socket.id,
+        roomId: connectionId,
+        viewerCount: room.viewers.size,
       });
-    
-      socket.on('answer', ({ answer, to }) => {
-        io.to(to).emit('answer', { answer, from: socket.id });
+
+      // Notify viewer about successful join
+      socket.emit("joinedRoom", {
+        hostId: room.hostId,
+        roomId: connectionId,
+        viewerCount: room.viewers.size,
       });
-    
-      socket.on('iceCandidate', ({ candidate, to }) => {
-        io.to(to).emit('iceCandidate', { candidate, from: socket.id });
+
+      // Notify all viewers about updated viewer count
+      io.to(connectionId).emit("viewerCountUpdated", {
+        count: room.viewers.size,
       });
-    
-      socket.on('disconnect', () => {
-        // Remove disconnected client
-        for (const [connectionId, socketId] of connections.entries()) {
-          if (socketId === socket.id) {
-            connections.delete(connectionId);
-          }
-        }
+
+      console.log(
+        `Viewer ${socket.id} joined room ${connectionId}. Total viewers: ${room.viewers.size}`
+      );
+    } else {
+      socket.emit("error", {
+        message: "Invalid connection ID or room no longer exists",
       });
-})
+    }
+  });
+
+  // Handle WebRTC signaling
+  socket.on("offer", ({ offer, to, roomId }) => {
+    io.to(to).emit("offer", { offer, from: socket.id, roomId });
+  });
+
+  socket.on("answer", ({ answer, to, roomId }) => {
+    io.to(to).emit("answer", { answer, from: socket.id, roomId });
+  });
+
+  socket.on("iceCandidate", ({ candidate, to, roomId }) => {
+    io.to(to).emit("iceCandidate", { candidate, from: socket.id, roomId });
+  });
+
+  // Handle disconnections
+  socket.on("disconnect", () => {
+    // Check all rooms for the disconnected socket
+    for (const [roomId, room] of rooms.entries()) {
+      if (room.hostId === socket.id) {
+        // Host disconnected, notify all viewers
+        room.viewers.forEach((viewerId) => {
+          io.to(viewerId).emit("hostDisconnected", {
+            message: "Host has disconnected",
+          });
+        });
+        rooms.delete(roomId);
+        console.log(`Host ${socket.id} disconnected, room ${roomId} closed`);
+      } else if (room.viewers.has(socket.id)) {
+        // Viewer disconnected
+        room.viewers.delete(socket.id);
+        // Notify host and remaining viewers
+        io.to(roomId).emit("viewerCountUpdated", {
+          count: room.viewers.size,
+        });
+        io.to(room.hostId).emit("viewerDisconnected", {
+          viewerId: socket.id,
+          remainingViewers: room.viewers.size,
+        });
+        console.log(
+          `Viewer ${socket.id} disconnected from room ${roomId}. Remaining viewers: ${room.viewers.size}`
+        );
+      }
+    }
+  });
+});
 
 server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-  });
+  console.log(`Server running on port ${PORT}`);
+});
